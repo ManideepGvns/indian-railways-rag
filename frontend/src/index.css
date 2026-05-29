@@ -1,0 +1,112 @@
+@import "tailwindcss";
+
+:root {
+  --ir-blue: #003087;
+  --ir-orange: #F26522;
+  --ir-light: #E8F0FE;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background: #0f1117;
+  color: #e2e8f0;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 3px;
+}
+
+/* Markdown prose */
+.prose-chat h1, .prose-chat h2, .prose-chat h3 {
+  font-weight: 600;
+  margin: 0.75em 0 0.4em;
+  color: #f1f5f9;
+}
+.prose-chat p {
+  margin: 0.4em 0;
+  line-height: 1.7;
+}
+.prose-chat ul, .prose-chat ol {
+  padding-left: 1.5em;
+  margin: 0.4em 0;
+}
+.prose-chat li {
+  margin: 0.2em 0;
+}
+.prose-chat code {
+  background: #1e293b;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  font-size: 0.875em;
+  color: #7dd3fc;
+}
+.prose-chat pre {
+  background: #1e293b;
+  padding: 1em;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 0.6em 0;
+}
+.prose-chat pre code {
+  background: none;
+  padding: 0;
+  color: #e2e8f0;
+}
+.prose-chat table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.6em 0;
+}
+.prose-chat th, .prose-chat td {
+  border: 1px solid #334155;
+  padding: 0.4em 0.8em;
+  text-align: left;
+}
+.prose-chat th {
+  background: #1e293b;
+  font-weight: 600;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.cursor-blink::after {
+  content: '▋';
+  animation: blink 1s infinite;
+  color: #60a5fa;
+}
+
+@keyframes spin-slow {
+  to { transform: rotate(360deg); }
+}
+.animate-spin-slow {
+  animation: spin-slow 3s linear infinite;
+}
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-fadeInUp {
+  animation: fadeInUp 0.4s ease both;
+}
+
+.glass {
+  background: rgba(15, 23, 42, 0.7);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255,255,255,0.07);
+}

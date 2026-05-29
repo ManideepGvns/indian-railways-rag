@@ -1,0 +1,42 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ir-rag-api:latest
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ir_rag_sqlite_data:/data/sqlite
+    environment:
+      DATABASE_URL: "sqlite:////data/sqlite/ir_rag.db"
+      QDRANT_URL: "${QDRANT_URL:-http://172.17.0.1:6333}"
+      QDRANT_API_KEY: "${QDRANT_API_KEY:-}"
+      QDRANT_COLLECTION: "${QDRANT_COLLECTION:-ir_chunks}"
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://172.17.0.1:11434}"
+      OLLAMA_CHAT_MODEL: "${OLLAMA_CHAT_MODEL:-llama3.2}"
+      OLLAMA_EMBED_MODEL: "${OLLAMA_EMBED_MODEL:-nomic-embed-text}"
+      JWT_SECRET: "${JWT_SECRET}"
+      CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost:8000}"
+      CHUNK_SIZE: "${CHUNK_SIZE:-1000}"
+      CHUNK_OVERLAP: "${CHUNK_OVERLAP:-150}"
+      RAG_TOP_K: "${RAG_TOP_K:-6}"
+      ADMIN_SEED_USERNAME: "${ADMIN_SEED_USERNAME:-admin}"
+      # WARNING: ADMIN_SEED_PASSWORD is visible in `docker inspect`.
+      # Change the admin password via the app immediately after first deploy,
+      # then remove ADMIN_SEED_PASSWORD from .env to prevent re-seeding.
+      ADMIN_SEED_PASSWORD: "${ADMIN_SEED_PASSWORD:-Admin@123}"
+    # On Linux, allow container to reach host services (Qdrant, Ollama) via host gateway
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  ir_rag_sqlite_data:
+    name: ir_rag_sqlite_data
