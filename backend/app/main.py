@@ -95,7 +95,7 @@ def health():
 
 
 # Serve built frontend (production Docker image)
-frontend_dist = os.path.join(os.path.dirname(__file__), "..", "..", "frontend_dist")
+frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend_dist")
 if os.path.isdir(frontend_dist):
     from fastapi.responses import FileResponse
     from fastapi import Request
