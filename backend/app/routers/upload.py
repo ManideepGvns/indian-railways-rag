@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import List
 
-from ..models import get_db, UploadedFile
+from ..models import get_db, SessionLocal, UploadedFile
 from ..models.models import User
 from ..core.security import get_current_user_id
 from ..core.config import get_settings
@@ -108,6 +108,7 @@ async def upload_file(
     db.refresh(db_file)
 
     filename = file.filename  # capture before streaming begins
+    db_file_id = db_file.id  # capture PK so the task can look it up in its own session
 
     # Queue used by the background ingest task to push progress events to the
     # SSE generator.  The generator reads with a short timeout so it can emit
@@ -116,7 +117,14 @@ async def upload_file(
     q: asyncio.Queue[dict] = asyncio.Queue()
 
     async def _ingest_task() -> None:
+        # Use an independent session so this task is not affected by FastAPI
+        # closing the dependency-injected session when the route handler returns.
+        task_db = SessionLocal()
         try:
+            task_file = task_db.query(UploadedFile).filter(UploadedFile.id == db_file_id).first()
+            if task_file is None:
+                raise RuntimeError("File record disappeared — cannot ingest.")
+
             await q.put({"type": "progress", "phase": "extracting"})
             chunks = await ingest_service.extract_and_chunk(filename, content, q)
             if not chunks:
@@ -135,42 +143,55 @@ async def upload_file(
                 file_id, filename, user_id, chunks, embeddings,
                 file_content_hash=sha256,
             )
-            db_file.chunk_count = len(chunks)
-            db_file.status = "ready"
-            db.commit()
+            task_file.chunk_count = len(chunks)
+            task_file.status = "ready"
+            task_db.commit()
 
             await q.put({
                 "type": "done",
                 "file": {
-                    "id": db_file.id,
-                    "file_id": db_file.file_id,
-                    "filename": db_file.filename,
-                    "chunk_count": db_file.chunk_count,
-                    "status": db_file.status,
+                    "id": task_file.id,
+                    "file_id": task_file.file_id,
+                    "filename": task_file.filename,
+                    "chunk_count": task_file.chunk_count,
+                    "status": task_file.status,
                 },
             })
         except Exception as exc:
-            db_file.status = "error"
-            db.commit()
+            try:
+                task_file = task_db.query(UploadedFile).filter(UploadedFile.id == db_file_id).first()
+                if task_file:
+                    task_file.status = "error"
+                    task_db.commit()
+            except Exception:
+                pass  # best-effort; always report the error to the client
             await q.put({"type": "error", "detail": str(exc)})
+        finally:
+            task_db.close()
 
     async def event_stream():
         task = asyncio.create_task(_ingest_task())
+        # A single persistent get-task is reused across keepalive cycles so that
+        # queue items are never silently consumed by stale shield() waiters.
+        get_task: asyncio.Task = asyncio.ensure_future(q.get())
         try:
             while True:
-                try:
-                    # Wait up to 15 s for the next progress event.  If nothing
-                    # arrives (Ollama is mid-inference), emit an SSE comment to
-                    # keep the connection alive through proxies and browsers.
-                    event = await asyncio.wait_for(asyncio.shield(q.get()), timeout=15)
-                except asyncio.TimeoutError:
+                # Wait up to 15 s for the next progress event.  On timeout emit
+                # an SSE comment to keep the connection alive through proxies and
+                # browsers, then resume waiting on the SAME get_task.
+                done, _ = await asyncio.wait({get_task}, timeout=15)
+                if not done:
                     yield ": keepalive\n\n"
                     continue
 
+                event: dict = get_task.result()
                 yield _sse(event)
                 if event.get("type") in ("done", "error"):
                     break
+                get_task = asyncio.ensure_future(q.get())
         finally:
+            if not get_task.done():
+                get_task.cancel()
             task.cancel()
             try:
                 await task

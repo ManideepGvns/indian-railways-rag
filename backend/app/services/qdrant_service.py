@@ -93,6 +93,9 @@ async def file_already_indexed(user_id: int, content_sha256: str) -> bool:
         return False
 
 
+_UPSERT_BATCH = 200  # points per HTTP request — keeps payloads well under Qdrant's limits
+
+
 async def upsert_chunks(
     file_id: str,
     filename: str,
@@ -120,7 +123,14 @@ async def upsert_chunks(
         )
         for i, (chunk, emb) in enumerate(zip(chunks, embeddings))
     ]
-    await client.upsert(collection_name=settings.qdrant_collection, points=points)
+    # Upsert in batches to avoid oversized HTTP requests and Qdrant timeouts.
+    # A single request with thousands of 768-dim vectors + text payloads can
+    # easily exceed 20 MB and trigger a 5 s client_request_timeout on the server.
+    for start in range(0, len(points), _UPSERT_BATCH):
+        await client.upsert(
+            collection_name=settings.qdrant_collection,
+            points=points[start : start + _UPSERT_BATCH],
+        )
 
 
 import re as _re
