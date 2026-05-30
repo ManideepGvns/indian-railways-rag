@@ -38,7 +38,9 @@ class Settings(BaseSettings):
 
     # Agentic chunking (LLM-based boundary detection during ingestion)
     max_agentic_chunk_chars: int = 3000  # hard ceiling per chunk before forced split
-    upload_timeout_secs: int = 1200      # 20 min — allows large docs with many LLM calls
+    # Default timeout raised to 12 h — agentic chunking on CPU makes 1 LLM call per
+    # paragraph boundary; an 800-page PDF can take several hours without a GPU.
+    upload_timeout_secs: int = 43200
 
     # Seed admin
     admin_seed_username: str = "admin"
