@@ -1,8 +1,9 @@
 from __future__ import annotations
+import asyncio
 import io
 import re
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from ..core.config import get_settings
 
@@ -374,7 +375,10 @@ def chunk_text(text: str) -> list[str]:
 # Agentic chunking (LLM-based boundary detection)
 # ---------------------------------------------------------------------------
 
-async def _agentic_chunk(text: str) -> list[str]:
+async def _agentic_chunk(
+    text: str,
+    progress_queue: Optional[asyncio.Queue] = None,
+) -> list[str]:
     """
     LLM-based agentic chunking.
 
@@ -384,6 +388,10 @@ async def _agentic_chunk(text: str) -> list[str]:
     `max_agentic_chunk_chars` is reached.
 
     Falls back transparently to the character splitter if Ollama is unreachable.
+
+    If `progress_queue` is provided, emits chunking progress events into it so
+    callers (e.g. an SSE endpoint) can relay live updates to the client without
+    the connection going idle during the long CPU-bound LLM loop.
     """
     from . import ollama_client as _ollama
 
@@ -395,6 +403,7 @@ async def _agentic_chunk(text: str) -> list[str]:
     if not paragraphs:
         return []
 
+    total = len(paragraphs)
     chunks: list[str] = []
     current_parts: list[str] = []
     current_len = 0
@@ -422,7 +431,16 @@ async def _agentic_chunk(text: str) -> list[str]:
             current_parts.append(para)
             current_len += len(para) + 2
 
-    for para in paragraphs:
+    for idx, para in enumerate(paragraphs):
+        # Emit progress so the SSE stream stays alive between Ollama calls
+        if progress_queue is not None:
+            await progress_queue.put({
+                "type": "progress",
+                "phase": "chunking",
+                "current": idx + 1,
+                "total": total,
+            })
+
         # Bootstrap: first paragraph always starts the first chunk
         if not current_parts and current_len == 0:
             _enqueue(para)
@@ -464,7 +482,11 @@ async def _agentic_chunk(text: str) -> list[str]:
 # Public entry point (async — uses agentic chunking)
 # ---------------------------------------------------------------------------
 
-async def extract_and_chunk(filename: str, file_bytes: bytes) -> list[str]:
+async def extract_and_chunk(
+    filename: str,
+    file_bytes: bytes,
+    progress_queue: Optional[asyncio.Queue] = None,
+) -> list[str]:
     """
     Extract text and chunk using LLM-based agentic boundary detection.
 
@@ -477,6 +499,10 @@ async def extract_and_chunk(filename: str, file_bytes: bytes) -> list[str]:
 
     PDF / DOCX path:
       Extract text (table-aware for PDFs) then apply agentic chunking.
+
+    If `progress_queue` is provided it is forwarded to `_agentic_chunk`, which
+    emits per-paragraph progress events so the SSE stream stays alive during
+    the long chunking phase.
     """
     suffix = Path(filename).suffix.lower()
 
@@ -491,10 +517,10 @@ async def extract_and_chunk(filename: str, file_bytes: bytes) -> list[str]:
         # Narrative TXT/MD — agentic chunking
         text = re.sub(r"\r\n", "\n", raw)
         text = re.sub(r"\n{3,}", "\n\n", text)
-        return await _agentic_chunk(text)
+        return await _agentic_chunk(text, progress_queue)
 
     # PDF / DOCX
     text = extract_text(filename, file_bytes)
     text = re.sub(r"\r\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return await _agentic_chunk(text)
+    return await _agentic_chunk(text, progress_queue)

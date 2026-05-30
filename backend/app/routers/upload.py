@@ -1,7 +1,9 @@
 from __future__ import annotations
 import asyncio
+import json
 import uuid
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import List
@@ -11,6 +13,10 @@ from ..models.models import User
 from ..core.security import get_current_user_id
 from ..core.config import get_settings
 from ..services import ingest_service, ollama_client, qdrant_service
+
+
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
 
 
 def _require_admin(
@@ -41,7 +47,7 @@ class FileListResponse(BaseModel):
     files: List[FileInfo]
 
 
-@router.post("", response_model=FileInfo)
+@router.post("")
 async def upload_file(
     file: UploadFile = File(...),
     user_id: int = Depends(_require_admin),
@@ -101,44 +107,80 @@ async def upload_file(
     db.commit()
     db.refresh(db_file)
 
-    async def _ingest() -> None:
-        chunks = await ingest_service.extract_and_chunk(file.filename, content)
-        if not chunks:
-            raise ValueError("No text could be extracted from the file.")
+    filename = file.filename  # capture before streaming begins
 
-        embeddings = []
-        for chunk in chunks:
-            emb = await ollama_client.embed(chunk)
-            embeddings.append(emb)
+    # Queue used by the background ingest task to push progress events to the
+    # SSE generator.  The generator reads with a short timeout so it can emit
+    # SSE keepalive comments even when the ingest is silent (e.g. a CPU-bound
+    # Ollama call that takes many seconds), preventing proxy / browser timeouts.
+    q: asyncio.Queue[dict] = asyncio.Queue()
 
-        await qdrant_service.ensure_collection(len(embeddings[0]))
-        await qdrant_service.upsert_chunks(
-            file_id, file.filename, user_id, chunks, embeddings,
-            file_content_hash=sha256,
-        )
-        db_file.chunk_count = len(chunks)
-        db_file.status = "ready"
+    async def _ingest_task() -> None:
+        try:
+            await q.put({"type": "progress", "phase": "extracting"})
+            chunks = await ingest_service.extract_and_chunk(filename, content, q)
+            if not chunks:
+                raise ValueError("No text could be extracted from the file.")
 
-    timeout_s = get_settings().upload_timeout_secs
-    try:
-        await asyncio.wait_for(_ingest(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        db_file.status = "error"
-        db.commit()
-        raise HTTPException(status_code=504, detail="Embedding timed out. The file may be too large or Ollama is overloaded.")
-    except Exception as exc:
-        db_file.status = "error"
-        db.commit()
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {exc}")
+            total = len(chunks)
+            embeddings: list = []
+            for i, chunk in enumerate(chunks):
+                emb = await ollama_client.embed(chunk)
+                embeddings.append(emb)
+                await q.put({"type": "progress", "phase": "embedding", "current": i + 1, "total": total})
 
-    db.commit()
-    db.refresh(db_file)
-    return FileInfo(
-        id=db_file.id,
-        file_id=db_file.file_id,
-        filename=db_file.filename,
-        chunk_count=db_file.chunk_count,
-        status=db_file.status,
+            await q.put({"type": "progress", "phase": "indexing"})
+            await qdrant_service.ensure_collection(len(embeddings[0]))
+            await qdrant_service.upsert_chunks(
+                file_id, filename, user_id, chunks, embeddings,
+                file_content_hash=sha256,
+            )
+            db_file.chunk_count = len(chunks)
+            db_file.status = "ready"
+            db.commit()
+
+            await q.put({
+                "type": "done",
+                "file": {
+                    "id": db_file.id,
+                    "file_id": db_file.file_id,
+                    "filename": db_file.filename,
+                    "chunk_count": db_file.chunk_count,
+                    "status": db_file.status,
+                },
+            })
+        except Exception as exc:
+            db_file.status = "error"
+            db.commit()
+            await q.put({"type": "error", "detail": str(exc)})
+
+    async def event_stream():
+        task = asyncio.create_task(_ingest_task())
+        try:
+            while True:
+                try:
+                    # Wait up to 15 s for the next progress event.  If nothing
+                    # arrives (Ollama is mid-inference), emit an SSE comment to
+                    # keep the connection alive through proxies and browsers.
+                    event = await asyncio.wait_for(asyncio.shield(q.get()), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+
+                yield _sse(event)
+                if event.get("type") in ("done", "error"):
+                    break
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

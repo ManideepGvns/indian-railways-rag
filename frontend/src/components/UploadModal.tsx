@@ -1,6 +1,6 @@
 import React, { useCallback, useRef, useState, useEffect } from "react";
 import { Upload, X, FileText, CheckCircle, AlertCircle, Trash2, Loader2 } from "lucide-react";
-import api from "../api/client";
+import api, { BASE } from "../api/client";
 
 interface FileRecord {
   id: number;
@@ -10,11 +10,18 @@ interface FileRecord {
   status: string;
 }
 
+interface EmbedProgress {
+  phase: "extracting" | "chunking" | "embedding" | "indexing";
+  current: number;
+  total: number;
+}
+
 interface UploadResult {
   filename: string;
   status: "uploading" | "done" | "duplicate" | "error";
   message?: string;
   file?: File;   // kept for "replace" action
+  progress?: EmbedProgress | null;
 }
 
 interface Props {
@@ -38,21 +45,70 @@ export default function UploadModal({ onClose }: Props) {
 
   useEffect(() => { fetchFiles(); }, [fetchFiles]);
 
-  // Upload a single File object; returns the result
-  const uploadOne = async (file: File): Promise<UploadResult> => {
+  // Upload a single file; streams SSE progress events from the backend.
+  const uploadOne = async (
+    file: File,
+    onProgress: (p: EmbedProgress) => void,
+  ): Promise<UploadResult> => {
     const form = new FormData();
     form.append("file", file);
+    const token = localStorage.getItem("ir_token");
+    const url = `${BASE}/api/upload`;
+
+    let res: Response;
     try {
-      await api.post("/upload", form, { headers: { "Content-Type": "multipart/form-data" } });
-      return { filename: file.name, status: "done" };
-    } catch (e: any) {
-      const status = e?.response?.status;
-      const detail: string = e?.response?.data?.detail ?? "Upload failed";
-      if (status === 409) {
-        return { filename: file.name, status: "duplicate", message: detail, file };
-      }
-      return { filename: file.name, status: "error", message: detail };
+      res = await fetch(url, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: form,
+      });
+    } catch {
+      return { filename: file.name, status: "error", message: "Network error — could not reach server" };
     }
+
+    // Non-2xx before streaming starts → parse as JSON error
+    if (!res.ok) {
+      if (res.status === 401) {
+        localStorage.removeItem("ir_token");
+        localStorage.removeItem("ir_user");
+        window.location.href = "/login";
+      }
+      const err = await res.json().catch(() => ({ detail: "Upload failed" }));
+      if (res.status === 409) return { filename: file.name, status: "duplicate", message: err.detail, file };
+      return { filename: file.name, status: "error", message: err.detail ?? "Upload failed" };
+    }
+
+    // Read the SSE stream
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE frames are separated by double newline
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? "";
+
+      for (const frame of frames) {
+        const dataLine = frame.split("\n").find((l) => l.startsWith("data: "));
+        if (!dataLine) continue;
+        try {
+          const event = JSON.parse(dataLine.slice(6));
+          if (event.type === "progress") {
+            onProgress({ phase: event.phase, current: event.current ?? 0, total: event.total ?? 0 });
+          } else if (event.type === "done") {
+            return { filename: file.name, status: "done" };
+          } else if (event.type === "error") {
+            return { filename: file.name, status: "error", message: event.detail };
+          }
+        } catch { /* ignore malformed frames */ }
+      }
+    }
+
+    return { filename: file.name, status: "done" };
   };
 
   const handleFiles = async (fileList: FileList | null) => {
@@ -66,13 +122,20 @@ export default function UploadModal({ onClose }: Props) {
     if (inputRef.current) inputRef.current.value = "";
 
     // Initialise all as "uploading"
-    setUploadResults(incoming.map((f) => ({ filename: f.name, status: "uploading" })));
+    setUploadResults(incoming.map((f) => ({ filename: f.name, status: "uploading", progress: null })));
 
     const results: UploadResult[] = [];
     for (const file of incoming) {
-      const result = await uploadOne(file);
+      const result = await uploadOne(file, (p) => {
+        setUploadResults((prev) =>
+          prev.map((r) => r.filename === file.name ? { ...r, progress: p } : r)
+        );
+      });
       results.push(result);
-      setUploadResults([...results, ...incoming.slice(results.length).map((f) => ({ filename: f.name, status: "uploading" as const }))]);
+      setUploadResults([
+        ...results,
+        ...incoming.slice(results.length).map((f) => ({ filename: f.name, status: "uploading" as const, progress: null })),
+      ]);
     }
 
     setUploadResults(results);
@@ -107,8 +170,12 @@ export default function UploadModal({ onClose }: Props) {
       setFiles((prev) => prev.filter((f) => f.file_id !== existing.file_id));
     }
     // Clear the duplicate banner for this file and re-upload
-    setUploadResults((prev) => prev.map((r) => r.filename === result.filename ? { ...r, status: "uploading" } : r));
-    const fresh = await uploadOne(result.file);
+    setUploadResults((prev) => prev.map((r) => r.filename === result.filename ? { ...r, status: "uploading", progress: null } : r));
+    const fresh = await uploadOne(result.file, (p) => {
+      setUploadResults((prev) =>
+        prev.map((r) => r.filename === result.filename ? { ...r, progress: p } : r)
+      );
+    });
     setUploadResults((prev) => prev.map((r) => r.filename === result.filename ? fresh : r));
     fetchFiles();
   };
@@ -147,7 +214,7 @@ export default function UploadModal({ onClose }: Props) {
           onDragLeave={() => setDragOver(false)}
           onDrop={handleDrop}
           onClick={() => !anyUploading && inputRef.current?.click()}
-          className={`border-2 border-dashed rounded-xl p-8 text-center transition-all mb-4 ${
+          className={`border-2 border-dashed rounded-xl p-6 text-center transition-all mb-4 ${
             anyUploading
               ? "border-blue-800/50 bg-blue-950/10 cursor-wait"
               : dragOver
@@ -155,14 +222,44 @@ export default function UploadModal({ onClose }: Props) {
               : "border-slate-700 hover:border-slate-500 bg-slate-900/30 hover:bg-slate-800/30 cursor-pointer"
           }`}
         >
-          {anyUploading
-            ? <Loader2 className="w-8 h-8 mx-auto mb-3 text-blue-400 animate-spin" />
-            : <Upload className={`w-8 h-8 mx-auto mb-3 ${dragOver ? "text-blue-400" : "text-slate-600"}`} />
-          }
-          <p className="text-sm text-slate-400">
-            {anyUploading ? "Embedding chunks…" : "Drop files here or click to browse"}
-          </p>
-          <p className="text-xs text-slate-600 mt-1">.pdf  .docx  .txt  .md</p>
+          {anyUploading ? (
+            <>
+              <Loader2 className="w-7 h-7 mx-auto mb-2 text-blue-400 animate-spin" />
+              {(() => {
+                const cur = uploadResults.find((r) => r.status === "uploading");
+                const p = cur?.progress;
+                if ((p?.phase === "chunking" || p?.phase === "embedding") && p.total > 0) {
+                  const pct = Math.round((p.current / p.total) * 100);
+                  const label = p.phase === "chunking"
+                    ? `Analyzing paragraph ${p.current} / ${p.total}`
+                    : `Embedding chunk ${p.current} / ${p.total}`;
+                  const color = p.phase === "chunking" ? "bg-violet-500" : "bg-blue-500";
+                  return (
+                    <>
+                      <p className="text-xs text-slate-400 mb-2">
+                        {label} &nbsp;·&nbsp; {pct}%
+                      </p>
+                      <div className="w-full max-w-xs mx-auto bg-slate-800 rounded-full h-1.5">
+                        <div
+                          className={`${color} h-1.5 rounded-full transition-[width] duration-300 ease-out`}
+                          style={{ width: `${pct}%` }}
+                        />
+                      </div>
+                    </>
+                  );
+                }
+                if (p?.phase === "indexing") return <p className="text-xs text-slate-400">Saving to vector store…</p>;
+                if (p?.phase === "extracting") return <p className="text-xs text-slate-400">Extracting text…</p>;
+                return <p className="text-xs text-slate-400">Uploading…</p>;
+              })()}
+            </>
+          ) : (
+            <>
+              <Upload className={`w-7 h-7 mx-auto mb-2 ${dragOver ? "text-blue-400" : "text-slate-600"}`} />
+              <p className="text-sm text-slate-400">Drop files here or click to browse</p>
+              <p className="text-xs text-slate-600 mt-1">.pdf  .docx  .txt  .md</p>
+            </>
+          )}
           <input
             ref={inputRef}
             type="file"
@@ -198,7 +295,29 @@ export default function UploadModal({ onClose }: Props) {
                 <div className="flex-1 min-w-0">
                   <span className="font-medium text-slate-200 truncate block">{r.filename}</span>
                   {r.status === "done" && <span className="text-green-400">Indexed successfully</span>}
-                  {r.status === "uploading" && <span className="text-slate-400">Embedding…</span>}
+                  {r.status === "uploading" && (
+                    <div>
+                      <span className="text-slate-400">
+                        {!r.progress && "Uploading…"}
+                        {r.progress?.phase === "extracting" && "Extracting text…"}
+                        {r.progress?.phase === "indexing" && "Saving to vector store…"}
+                        {r.progress?.phase === "chunking" && r.progress.total > 0 &&
+                          `Analyzing paragraph ${r.progress.current} / ${r.progress.total}`}
+                        {r.progress?.phase === "embedding" && r.progress.total > 0 &&
+                          `Embedding chunk ${r.progress.current} / ${r.progress.total}`}
+                      </span>
+                      {(r.progress?.phase === "chunking" || r.progress?.phase === "embedding") && r.progress.total > 0 && (
+                        <div className="mt-1.5 w-full bg-slate-800 rounded-full h-1">
+                          <div
+                            className={`h-1 rounded-full transition-[width] duration-300 ease-out ${
+                              r.progress.phase === "chunking" ? "bg-violet-500" : "bg-blue-500"
+                            }`}
+                            style={{ width: `${Math.round((r.progress.current / r.progress.total) * 100)}%` }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )}
                   {r.status === "error" && <span className="text-red-300">{r.message}</span>}
                   {r.status === "duplicate" && (
                     <span className="text-amber-300">
