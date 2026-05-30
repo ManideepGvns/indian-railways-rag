@@ -75,6 +75,22 @@ async def upload_file(
 
     file_id = str(uuid.uuid4())
 
+    # Remove any stale "error" records for the same filename so the user
+    # gets a clean slate when retrying a previously failed upload.
+    stale = db.query(UploadedFile).filter(
+        UploadedFile.user_id == user_id,
+        UploadedFile.filename == file.filename,
+        UploadedFile.status == "error",
+    ).all()
+    for s in stale:
+        try:
+            await qdrant_service.delete_file_chunks(s.file_id)
+        except Exception:
+            pass
+        db.delete(s)
+    if stale:
+        db.commit()
+
     db_file = UploadedFile(
         user_id=user_id,
         filename=file.filename,
@@ -152,7 +168,13 @@ async def delete_file(
     if not db_file:
         raise HTTPException(status_code=404, detail="File not found")
 
-    await qdrant_service.delete_file_chunks(file_id)
+    # Best-effort Qdrant cleanup — if the upload previously failed (status="error"),
+    # the collection or vectors may not exist; always remove the SQLite record.
+    try:
+        await qdrant_service.delete_file_chunks(file_id)
+    except Exception:
+        pass
+
     db.delete(db_file)
     db.commit()
     return {"message": "File deleted"}

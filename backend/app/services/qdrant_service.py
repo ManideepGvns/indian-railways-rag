@@ -231,13 +231,21 @@ async def search(
 
 
 async def delete_file_chunks(file_id: str) -> None:
+    """Delete all Qdrant vectors for a file. No-ops gracefully if the collection
+    does not exist (e.g. the upload failed before any vectors were stored)."""
     settings = get_settings()
     client = get_client()
-    await client.delete(
-        collection_name=settings.qdrant_collection,
-        points_selector=FilterSelector(
-            filter=Filter(
-                must=[FieldCondition(key="file_id", match=MatchValue(value=file_id))]
-            )
-        ),
-    )
+    try:
+        exists = await client.collection_exists(settings.qdrant_collection)
+        if not exists:
+            return
+        await client.delete(
+            collection_name=settings.qdrant_collection,
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[FieldCondition(key="file_id", match=MatchValue(value=file_id))]
+                )
+            ),
+        )
+    except Exception:
+        pass  # Best-effort — always allow the SQLite record to be removed
